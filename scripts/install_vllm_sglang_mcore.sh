@@ -1,7 +1,7 @@
 #!/bin/bash
 
 USE_MEGATRON=${USE_MEGATRON:-1}
-USE_SGLANG=${USE_SGLANG:-1}
+USE_SGLANG=${USE_SGLANG:-1}ls
 
 export MAX_JOBS=32
 
