@@ -69,13 +69,13 @@ def default_compute_score(
         from . import math_verify
         from . import reasoning
         
-        if extra_info["reasoning_states"]:
+        if extra_infoin ["reasoning_states"]:
             gt_score = math_verify.compute_score(solution_str, ground_truth)
             coherence, anchor, drift = reasoning.calc_coherence_anchor_drift(data_source, solution_str, ground_truth, extra_info)
             score = 0.5 * gt_score + 0.25 * coherence + 0.125 * (1-anchor) + 0.125 * drift
             res = {
                 'score': score,
-                'acc': gt_score, 
+                'acc': gt_score,
                 'coherence': coherence,
                 'anchor': anchor,
                 'drift': drift
@@ -84,6 +84,7 @@ def default_compute_score(
             res = math_verify.compute_score(solution_str, ground_truth)
     elif data_source == "math_dapo" or data_source.startswith("aime"):
         from . import math_dapo
+
         res = math_dapo.compute_score(solution_str, ground_truth)
     elif data_source in [
         "numina_aops_forum",
@@ -127,12 +128,7 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
-    elif data_source in ["hendrycks/ethics"]:
-        from . import metacognitive
-        if extra_info["return_hidden"]:
-            res = metacognitive.get_metacognitive_reward(ground_truth, extra_info)
-        else:
-            raise NotImplementedError(f"Reward function is not implemented for {data_source=} without hidden states")
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
@@ -162,3 +158,4 @@ def _default_compute_score(
 
 
 __all__ = ["default_compute_score"]
+

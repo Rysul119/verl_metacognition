@@ -42,22 +42,9 @@ def default_compute_score(
     """
     if data_source == "openai/gsm8k":
         from . import gsm8k
-        from . import reasoning
-        
-        if extra_info["reasoning_states"]:
-            gt_score = gsm8k.compute_score(solution_str, ground_truth)
-            coherence, anchor, drift = reasoning.calc_coherence_anchor_drift(data_source, solution_str, ground_truth, extra_info)
-            score = 0.5 * gt_score + 0.25 * coherence + 0.125 * (1-anchor) + 0.125 * drift
-            res = {
-                'score': score,
-                'acc': gt_score, 
-                'coherence': coherence,
-                'anchor': anchor,
-                'drift': drift
-            }
-        else:
-            res = gsm8k.compute_score(solution_str, ground_truth)
-    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "gneubig/aime-1983-2024", "mrk21/math"]:
+
+        res = gsm8k.compute_score(solution_str, ground_truth, method='math')
+    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "gneubig/aime-1983-2024", "mrk21/math500"]:
         #from . import math
 
         #res = math.compute_score(solution_str, ground_truth)
@@ -67,23 +54,10 @@ def default_compute_score(
         # To use it, override the `compute_score` function with the following implementation:
 
         from . import math_verify
-        from . import reasoning
-        
-        if extra_info["reasoning_states"]:
-            gt_score = math_verify.compute_score(solution_str, ground_truth)
-            coherence, anchor, drift = reasoning.calc_coherence_anchor_drift(data_source, solution_str, ground_truth, extra_info)
-            score = 0.5 * gt_score + 0.25 * coherence + 0.125 * (1-anchor) + 0.125 * drift
-            res = {
-                'score': score,
-                'acc': gt_score, 
-                'coherence': coherence,
-                'anchor': anchor,
-                'drift': drift
-            }
-        else:
-            res = math_verify.compute_score(solution_str, ground_truth)
+        res = math_verify.compute_score(solution_str, ground_truth)
     elif data_source == "math_dapo" or data_source.startswith("aime"):
         from . import math_dapo
+
         res = math_dapo.compute_score(solution_str, ground_truth)
     elif data_source in [
         "numina_aops_forum",
@@ -127,12 +101,7 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
-    elif data_source in ["hendrycks/ethics"]:
-        from . import metacognitive
-        if extra_info["return_hidden"]:
-            res = metacognitive.get_metacognitive_reward(ground_truth, extra_info)
-        else:
-            raise NotImplementedError(f"Reward function is not implemented for {data_source=} without hidden states")
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
@@ -142,6 +111,7 @@ def default_compute_score(
         return float(res)
     else:
         return float(res[0])
+
 
 @deprecated("verl.utils.reward_score.default_compute_score")
 def _default_compute_score(

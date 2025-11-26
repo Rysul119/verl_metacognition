@@ -50,12 +50,14 @@ class Tracking:
         self.logger = {}
 
         if "tracking" in default_backend or "wandb" in default_backend:
-            import wandb
+            import os
 
+            import wandb
+           
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
-            wandb.init(project=project_name, name=experiment_name, config=config, settings=settings)
+            wandb.init(project=project_name, name=experiment_name, id=os.environ.get("WANDB_RUN_ID"), resume="allow", config=config, settings=settings) #changes to make wandb resumeable
             self.logger["wandb"] = wandb
 
         if "mlflow" in default_backend:

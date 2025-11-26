@@ -49,7 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.reward import compute_reward, compute_reward_async, compute_reward_reasoning, compute_reward_metacognitive
+from verl.trainer.ppo.reward import compute_reward, compute_reward_async, compute_reward_reasoning
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import (
@@ -58,7 +58,6 @@ from verl.utils.metric import (
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.utils.dataset.rl_dataset import HoldoutWrapped
 
 WorkerType = Type[Worker]
 
@@ -300,7 +299,6 @@ class RayPPOTrainer:
         val_reward_fn=None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
-        holdout_dataset: Optional[Dataset] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name="cuda",
@@ -370,7 +368,7 @@ class RayPPOTrainer:
             raise NotImplementedError
 
         self._validate_config()
-        self._create_dataloader(train_dataset, val_dataset, holdout_dataset, collate_fn, train_sampler)
+        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _validate_config(self):
         config = self.config
@@ -539,7 +537,7 @@ class RayPPOTrainer:
 
         print("[validate_config] All configuration checks passed successfully!")
 
-    def _create_dataloader(self, train_dataset, val_dataset, holdout_dataset, collate_fn, train_sampler):
+    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
         """
         Creates the train and validation dataloaders.
         """
@@ -554,21 +552,6 @@ class RayPPOTrainer:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
-        if self.config.reward_model.metacognition.enabled:
-            self.holdout_dataset = create_rl_dataset(
-                self.config.data.holdout_files, self.config.data, self.tokenizer, self.processor
-            )
-            #self.holdout_dataset = HoldoutWrapped(holdout_dataset, label_key="label")
-            self.holdout_dataloader = StatefulDataLoader(
-                dataset=self.holdout_dataset,
-                batch_size=self.config.data.train_batch_size, # to load the whole batch of data
-                shuffle=False,
-                num_workers=self.config.data.get("dataloader_num_workers", 8),
-                collate_fn=collate_fn,   # reuse the same collate_fn
-                drop_last=False,
-                pin_memory=False,
-        )
-
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:
@@ -759,8 +742,6 @@ class RayPPOTrainer:
             # evaluate using reward_function
             if self.config.reward_model.reasoning:
                 result = self.val_reward_fn(test_batch, self.actor_rollout_wg.compute_log_prob_reward, self.config, return_dict=True)
-            elif self.config.reward_model.metacognition.enabled:
-                result = self.val_reward_fn(test_batch, self.lr_weights, self.actor_rollout_wg.get_mean_hidden_states, self.config, return_dict=True)
             else:
                 result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
@@ -1079,62 +1060,6 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
-        # calculate the axes
-        if self.config.reward_model.metacognition.enabled:
-            try:
-                from sklearn.linear_model import LogisticRegression
-            except Exception as e:
-                raise RuntimeError(
-                    "scikit-learn is required only on the driver when metacognition.enabled=True. "
-                    "Install it in the controller env (pip install scikit-learn)."
-                ) from e
-
-            mean_hidden_states = []
-            labels = []
-            for batch_dict in self.holdout_dataloader:
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                bs, seqlen = batch.batch["input_ids"].size()
-                #print("batch size {} sequence len {}".format(bs, seqlen))
-                # minimal meta_info expected by get_mean_hidden_states
-                if "micro_batch_size" not in batch.meta_info:
-                    mb = (
-                        self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu")
-                        or self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size")
-                        or bs
-                    )
-                    batch.meta_info["micro_batch_size"] = int(mb)
-                batch.meta_info["use_dynamic_bsz"] = False
-                if batch.meta_info["use_dynamic_bsz"] and "max_token_len" not in batch.meta_info:
-                    batch.meta_info["max_token_len"] = int(seqlen)
-                if "temperature" not in batch.meta_info:
-                    batch.meta_info["temperature"] = 1.0
-                
-                batch.batch["responses"] = batch.batch["input_ids"].new_empty((bs, 0))  # zero-length response
-                batch.meta_info["_verl_auto_padding"] = True # allows when full batch is not divisible by chunk size
-                mhs = self.actor_rollout_wg.get_mean_hidden_states(batch).batch["hidden_states"]
-                #print("mean_hidden_state size {}".format(mhs.size()))
-                mean_hidden_states.append(mhs) # (mb, L, H)
-                y = batch_dict["label"]
-                #print("y type {} y shape {}".format(type(y), len(y)))
-                labels.append(y)
-            #print("label size {}".format(len(labels)))
-            mean_hidden_states = torch.permute(torch.cat(mean_hidden_states, dim=0), (1,0,2)).to(dtype=torch.float32).numpy() # (L, b, H)
-            selected_hidden_states = mean_hidden_states[self.config.reward_model.metacognition.hlayers]
-            labels = np.concatenate(labels) # (b,)
-            labels = np.asarray(labels, dtype=np.int64)
-            #print("mean_hidden_states size {}, labels size {}".format(mean_hidden_states.shape, labels.shape))
-            weights = []
-            for mean_hidden_states_l in selected_hidden_states:
-                lr_clf = LogisticRegression(penalty='l2', C=1, solver='lbfgs', max_iter=10000)
-                lr_clf.fit(mean_hidden_states_l, labels)
-                w = lr_clf.coef_.T # dim (H, 1)
-                w_norm = w/np.linalg.norm(w, keepdims=True) # normalize the weights
-                weights.append(torch.tensor(w_norm)[None, :]) 
-            #print("weight list length {}".format(len(weights)))
-            self.lr_weights = torch.vstack(weights).to(dtype=torch.float32) # [L, H, 1]
-            #print("lr weights shape {}".format(self.lr_weights.shape))
-            #self.lr_weights=None
-
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -1270,11 +1195,8 @@ class RayPPOTrainer:
                         else:
                             if self.config.reward_model.reasoning:
                                 reward_tensor, reward_extra_infos_dict = compute_reward_reasoning(batch, self.actor_rollout_wg.compute_log_prob_reward, self.config, self.reward_fn)
-                            elif self.config.reward_model.metacognition.enabled:
-                                reward_tensor, reward_extra_infos_dict = compute_reward_metacognitive(batch, self.lr_weights, self.actor_rollout_wg.get_mean_hidden_states, self.config, self.reward_fn)
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1455,3 +1377,4 @@ class RayPPOTrainer:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
+

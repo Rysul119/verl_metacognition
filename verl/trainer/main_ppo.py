@@ -21,7 +21,7 @@ import socket
 import hydra
 import ray
 from omegaconf import OmegaConf
-
+os.environ.pop("ROCR_VISIBLE_DEVICES", None)
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 
@@ -43,7 +43,9 @@ def run_ppo(config) -> None:
             runtime_env={
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "true",
-                    "NCCL_DEBUG": "WARN",
+                    #"NCCL_DEBUG": "WARN",
+                    "NCCL_DEBUG": "INFO",
+                    "NCCL_DEBUG_SUBSYS": "ALL",
                     "VLLM_LOGGING_LEVEL": "WARN",
                     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                 }

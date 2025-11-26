@@ -80,7 +80,246 @@ class DataParallelPPOActor(BasePPOActor):
         self.device_name = get_device_name()
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
+        self, micro_batch, temperature, calculate_entropy=False, return_hidden = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor|None]:
+        """
+        Returns:
+            entropy: # (bs, response_len)
+            log_probs: # (bs, response_len)
+            hidden_state: # (num_l, bs, prompt_len, hidden_size) when return_hidden is True
+        """
+        response_length = micro_batch["responses"].size(-1)
+        prompt_length = micro_batch["input_ids"].size(1) - response_length
+        if return_hidden:
+            use_fused_kernel_now = False
+        else:
+            use_fused_kernel_now = self.use_fused_kernels
+        multi_modal_inputs = {}
+        if "multi_modal_inputs" in micro_batch.keys():
+            if "image_bound" in micro_batch["multi_modal_inputs"][0]:  # minicpm-o logic
+                for key in micro_batch["multi_modal_inputs"][0].keys():
+                    multi_modal_inputs[key] = [inputs[key] for inputs in micro_batch["multi_modal_inputs"]]
+            else:
+                for key in micro_batch["multi_modal_inputs"][0].keys():
+                    multi_modal_inputs[key] = torch.cat(
+                        [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
+                    )
+
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            input_ids = micro_batch["input_ids"]
+            batch_size, seqlen = input_ids.shape
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
+            entropy = None
+            hidden_states = None
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
+
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
+                    input_ids.unsqueeze(-1), attention_mask
+                )  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # unpad the position_ids to align the rotary
+                if position_ids.dim() == 3:
+                    position_ids_rmpad = (
+                        index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                        .transpose(0, 1)
+                        .unsqueeze(1)
+                    )  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
+                else:
+                    position_ids_rmpad = index_first_axis(
+                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                    ).transpose(0, 1)
+
+                if "image_bound" in multi_modal_inputs:
+                    from verl.utils.dataset.vision_utils import process_multi_modal_inputs_for_minicpmo
+
+                    multi_modal_inputs = process_multi_modal_inputs_for_minicpmo(
+                        input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
+                    )
+
+                # for compute the log_prob
+                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+
+                # pad and slice the inputs if sp > 1
+                if self.use_ulysses_sp:
+                    is_vlm_model = "multi_modal_inputs" in micro_batch.keys()
+                    if is_vlm_model:
+                        # vlm model's inputs will be sliced after embedding
+                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
+                            input_ids_rmpad,
+                            position_ids_rmpad=position_ids_rmpad,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+                    else:
+                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                            input_ids_rmpad,
+                            position_ids_rmpad=position_ids_rmpad,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad_rolled,
+                        position_ids_rmpad=None,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
+
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+
+                # only pass input_ids and position_ids to enable flash_attn_varlen
+                extra_args = {}
+                if use_fused_kernel_now:
+                    extra_args["temperature"] = temperature
+                    extra_args["return_dict"] = True
+                else:
+                    if return_hidden: 
+                        extra_args["output_hidden_states"] = True
+                        extra_args["return_dict"] = True
+
+                output = self.actor_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    **extra_args,
+                )  # prevent model thinks we are generating
+
+                
+                if use_fused_kernel_now:
+                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
+                    entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+
+                else:
+                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                    logits_rmpad.div_(temperature)
+
+                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                    inplace_backward = True
+                    if calculate_entropy:
+                        inplace_backward = False
+                    log_probs = logprobs_from_logits(
+                        logits=logits_rmpad,
+                        labels=input_ids_rmpad_rolled,
+                        inplace_backward=inplace_backward,
+                    )
+
+                    # compute entropy
+                    if calculate_entropy:
+                        if not self.config.entropy_checkpointing:
+                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                        else:
+                            entropy_rmpad = torch.utils.checkpoint.checkpoint(
+                                self.compute_entropy_from_logits, logits_rmpad
+                            )
+
+                    # Collect hidden states if requested
+                    if return_hidden:
+                        # Take all but the first (embedding) hidden state
+                        layers = []
+                        for t in output.hidden_states[1:]:
+                            # t is typically (1, total_nnz, hidden) in this path
+                            if t.dim() == 3 and t.size(0) == 1:
+                                t = t.squeeze(0)          # -> (total_nnz, hidden)
+                            layers.append(t)
+
+                # gather log_prob if sp > 1
+                if self.use_ulysses_sp:
+                    # gather and unpad for the ulysses sp
+                    log_probs = gather_outpus_and_unpad(
+                        log_probs,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+                    if calculate_entropy:
+                        entropy_rmpad = gather_outpus_and_unpad(
+                            entropy_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                    if return_hidden:
+                        layers = [gather_outpus_and_unpad(t, gather_dim=0, unpad_dim=0, padding_size=pad_size) for t in layers]   # each still (total_nnz, hidden)
+
+
+                # pad back to (bsz, seqlen)
+                if calculate_entropy:
+                    full_entropy = pad_input(
+                        hidden_states=entropy_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                full_log_probs = pad_input(
+                    hidden_states=log_probs.unsqueeze(-1),
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
+
+                # only return response part:
+                if calculate_entropy:
+                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+
+                if return_hidden:
+                    # Pad back per layer to (bs, seqlen, hidden)
+                    full_hidden_layers = [pad_input(t, indices=indices, batch=batch_size, seqlen=seqlen) for t in layers]  # list of (bs, seqlen, hidden)
+                    # Stack to a single tensor if you want: (num_layers-1, bs, seqlen, hidden)
+                    full_hidden = torch.stack(full_hidden_layers, dim=0)
+                    # Token-aligned prompt slice (include all prompt tokens)
+                    hidden_states = full_hidden[:, :, :prompt_length, :]   # (L, B, P, H)
+
+            else:  # not using rmpad and no ulysses sp
+                extra_args = {}
+                if use_fused_kernel_now:
+                    extra_args["temperature"] = temperature
+                    extra_args["return_dict"] = True
+                else:
+                    if return_hidden:
+                        extra_args["output_hidden_states"] = True
+                        extra_args["return_dict"] = True
+
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    **extra_args,
+                )  # prevent model thinks we are generating
+
+                if use_fused_kernel_now:
+                    log_probs = output.log_probs[:, -response_length - 1 : -1]
+                    entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+
+                else:
+                    logits = output.logits
+
+                    logits.div_(temperature)
+                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    if calculate_entropy:
+                        if not self.config.entropy_checkpointing:
+                            entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                        else:
+                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+
+                    if return_hidden:
+                        # tuple of (bs, seqlen, hidden)
+                        layers = list(output.hidden_states[1:])
+                        full_hidden = torch.stack(layers, dim=0)          # (L, B, S, H)
+                        hidden_states = full_hidden[:, :, :prompt_length, :]   # (L, B, P, H)
+            
+            if return_hidden:
+                return entropy, log_probs, hidden_states
+            else:
+                return entropy, log_probs
+
+    def _forward_micro_batch_bak(
+        self, micro_batch, temperature, calculate_entropy=False, output_hidden_states=False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -170,6 +409,7 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
+                    output_hidden_states=output_hidden_states,
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
@@ -248,6 +488,7 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
+                    output_hidden_states=output_hidden_states,
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
@@ -285,6 +526,125 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.actor_optimizer.step()
         return grad_norm
+    
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def get_mean_hidden_states(self, data: DataProto) -> torch.Tensor:
+        """
+        Args:
+            data (DataProto): a DataProto containing keys
+
+                ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
+                concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
+
+                ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
+
+                ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
+
+                ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
+        Returns mean (over tokens) prompt-only hidden states aggregated over micro-batches.
+
+        Shape: (num_layers_minus_1, batch_size, hidden_size)  == (L, B, H)
+        """
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info.get("temperature", 1.0)  # required by _forward_micro_batch signature
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+
+        # --- split like compute_log_prob ---
+        def _get_micro_batches(data: DataProto):
+            select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+            batch = data.select(batch_keys=select_keys).batch
+            has_mm = "multi_modal_inputs" in data.non_tensor_batch
+
+            if has_mm:
+                all_mm = data.non_tensor_batch["multi_modal_inputs"]
+                if use_dynamic_bsz:
+                    max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+                    text_mbs, textual_indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+                    final = []
+                    for idxs, td in zip(textual_indices, text_mbs, strict=True):
+                        mm_list = [all_mm[i] for i in idxs]
+                        mb = {k: v for k, v in td.items()}
+                        mb["multi_modal_inputs"] = mm_list
+                        final.append(mb)
+                    return final, textual_indices
+                else:
+                    num_mbs = batch.batch_size[0] // micro_batch_size
+                    return data.select(select_keys, ["multi_modal_inputs"]).chunk(num_mbs), None
+            elif use_dynamic_bsz:
+                max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+                mbs, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+                return mbs, indices
+            else:
+                return batch.split(micro_batch_size), None
+
+        micro_batches, indices = _get_micro_batches(data)
+
+        hidden_mean_chunks = []
+        for mb in micro_batches:
+            # move to device
+            if isinstance(mb, DataProto):
+                mb = {**mb.batch.to(get_device_id()), **mb.non_tensor_batch}
+            elif isinstance(mb, dict):
+                for k, v in list(mb.items()):
+                    if isinstance(v, torch.Tensor):
+                        mb[k] = v.to(get_device_id())
+                    elif k == "multi_modal_inputs" and v is not None:
+                        mb[k] = [{kk: vv.to(get_device_id()) for kk, vv in item.items()} for item in v]
+
+            with torch.no_grad():
+                _, _, hidden = self._forward_micro_batch(
+                    micro_batch=mb,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                    return_hidden=True,
+                )
+                #print("hidden shape {}".format(hidden.size()))
+                # hidden: (L, mbs, P, H)
+                # Build prompt mask for this micro-batch:
+                # token-aligned prompt length = seqlen - response_len
+                prompt_len = mb["input_ids"].size(1) - mb["responses"].size(-1)  # P
+                prompt_mask = mb["attention_mask"][:, :prompt_len]               # (mbs, P)
+                # Broadcast mask to (1, mbs, P, 1)
+                m = prompt_mask.to(dtype=hidden.dtype, device=hidden.device).unsqueeze(0).unsqueeze(-1)
+                
+                # Weighted mean over tokens (dim=2)
+                num = (hidden * m).sum(dim=2)     # (L, mbs, H)
+                denom = m.sum(dim=2).clamp_min(1e-6)   # (1, mbs, 1)
+                means = (num / denom) # (L, mbs, H)
+                #print("hidden mean shape {}".format(means.shape))
+                hidden_mean_chunks.append(means)
+
+        # concat along batch dim (dim=1)
+        hidden_states = torch.permute(torch.cat(hidden_mean_chunks, dim=1), (1,0,2))  # (bs, L, H)
+        #print("hidden state in dp_actor size {}".format(hidden_states.shape))
+        # undo dynamic-bsz permutation if used
+        if use_dynamic_bsz:
+            flat = list(itertools.chain.from_iterable(indices))
+            assert hidden_states.size(1) == len(flat), f"{hidden_states.size(1)} vs {len(flat)}"
+            revert = torch.tensor(get_reverse_idx(flat), dtype=torch.long, device=hidden_states.device)
+            hidden_states = hidden_states.index_select(dim=1, index=revert)
+
+        return hidden_states
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def compute_log_prob_micro_batch(self, data: DataProto) -> torch.Tensor:
+        self.actor_module.eval()
+        # Keep only what _forward_micro_batch expects
+        has_mmi = "multi_modal_inputs" in data.non_tensor_batch
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        non_tensor_keys = ["multi_modal_inputs"] if has_mmi else []
+        temperature = data.meta_info["temperature"]
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_keys)
+
+        # Build the dict that _forward_micro_batch consumes
+        model_inputs = {**data.batch, **data.non_tensor_batch}
+        with torch.no_grad():
+            _, log_probs = self._forward_micro_batch(model_inputs, temperature=temperature, calculate_entropy=False)
+
+        return log_probs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
@@ -311,7 +671,7 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
-
+        #print(use_dynamic_bsz)
         def _get_micro_batches(data: DataProto) -> Tuple[list, list | None]:
             select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
             batch = data.select(batch_keys=select_keys).batch

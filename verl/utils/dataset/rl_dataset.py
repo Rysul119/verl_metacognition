@@ -324,3 +324,27 @@ class RLHFDataset(Dataset):
             return state
 
         return self.__dict__.copy()
+
+class HoldoutWrapped(torch.utils.data.Dataset):
+    """
+    Wrap an existing RLHFDataset and add a label field from its HF dataframe.
+    Assumes the parquet(s) used for RLHFDataset contain a label column `label_key`.
+    """
+    def __init__(self, base_rlhf_ds, label_key: str = "label"):
+        self.base = base_rlhf_ds                    # RLHFDataset instance
+        self.df = self.base.dataframe               # HF datasets.Dataset (already filtered)
+        self.label_key = label_key
+        assert self.label_key in self.df.column_names, \
+            f"'{self.label_key}' not found in parquet columns: {self.df.column_names}"
+
+    def __len__(self): 
+        return len(self.base)
+
+    def __getitem__(self, i):
+        row_dict = self.base[i]                     # builds input_ids, attention_mask, position_ids, etc.
+        # pull aligned label from the same (post-filter) row
+        y = self.df[i][self.label_key]
+        # torchify scalar label
+        row_dict["cls_label"] = torch.as_tensor(y, dtype=torch.long)
+        return row_dict
+        

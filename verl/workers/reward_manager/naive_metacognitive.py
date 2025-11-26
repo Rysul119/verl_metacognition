@@ -1,28 +1,14 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from collections import defaultdict
 
 import torch
+import numpy as np
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 
-
-@register("naive")
-class NaiveRewardManager:
+@register("naive_metacognitive")
+class NaiveMetaCognitiveRewardManager:
     """The reward manager."""
 
     def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
@@ -41,8 +27,10 @@ class NaiveRewardManager:
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
 
-    def __call__(self, data: DataProto, return_dict=False):
-        """We will expand this function gradually based on the available datasets"""
+    def __call__(self, data: DataProto, weights, actor, config, return_dict=False):
+        """
+        actor: actor from the actor work group to get the hidden_states
+        """
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
@@ -53,10 +41,17 @@ class NaiveRewardManager:
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
-
+        data.meta_info["_verl_auto_padding"] = True # pad when batch size is not divisible by chunk size
+        mean_residuals = actor(data)  # (B, L, H)
+        mhs = torch.permute(mean_residuals.batch["hidden_states"], (1,0,2)).to(dtype=torch.float32)[config.reward_model.metacognition.hlayers]     # dim (L, B, H) 
+        bs = mhs.shape[1] # batch size as _verl_auto_padding create some padded input
+        print("naive_metacognitive mhs shape {} weights shape {}".format(mhs.shape, weights.shape))
+        activations = torch.matmul(mhs, weights) # mean_hidden_states dim (L,B, H) weights dim (L, H, 1), activation dim (L, B, 1)
+        thresholds = torch.median(activations, dim=1)[0] # (L, 1)
+        print("data size {} activations dim {} thresholds dim {}".format(len(data), activations.shape, thresholds.shape))
         already_print_data_sources = {}
 
-        for i in range(len(data)):
+        for i in range(bs):
             data_item = data[i]  # DataProtoItem
 
             prompt_ids = data_item.batch["prompts"]
@@ -79,7 +74,12 @@ class NaiveRewardManager:
             extra_info = data_item.non_tensor_batch.get("extra_info", {})
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             extra_info["num_turns"] = num_turns
-            extra_info["reasoning_states"] = False
+            extra_info["activations"] = activations[:, i, :]  # (L, 1) 
+            extra_info["thresholds"] = thresholds # (L, 1)
+            extra_info["data"] = data_item
+            extra_info["tokenizer"] = self.tokenizer
+            extra_info["max_response_length"] = config.data.max_response_length
+            extra_info["return_hidden"] = True
 
             score = self.compute_score(
                 data_source=data_source,

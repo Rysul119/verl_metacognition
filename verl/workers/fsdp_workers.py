@@ -751,6 +751,126 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # clear kv cache
         get_torch_device().empty_cache()
         return output
+    
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @DistProfiler.annotate(color="yellow")
+    def get_mean_hidden_states(self, data: DataProto):
+        # when is_lora is True, we use the actor without lora applied to calculate the log_prob
+        # which is mostly used for ref log_prob calculation
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        # Support all hardwares
+        from contextlib import nullcontext
+
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        data = data.to(get_device_id())
+        # we should always recompute old_log_probs when it is HybridEngine
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = False
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        #print("data response size in fsdp {}".format(data.batch["responses"].shape))
+        # perform recompute log_prob
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            with adapter_ctx:
+                output = self.actor.get_mean_hidden_states(data=data)
+            output = DataProto.from_dict(
+                tensors={"hidden_states": output}, # bs, L, H
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to("cpu")
+        #print("hidden size in fsdp {}".format(output.batch["hidden_states"].shape))
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during get_mean_hidden_states", logger=logger)
+
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @DistProfiler.annotate(color="green")
+    def compute_log_prob_reward(self, data: DataProto):
+        # when is_lora is True, we use the actor without lora applied to calculate the log_prob
+        # which is mostly used for ref log_prob calculation
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        # Support all hardwares
+        from contextlib import nullcontext
+
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        data = data.to(get_device_id())
+        # we should always recompute old_log_probs when it is HybridEngine
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = True
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        # perform recompute log_prob
+        with self.ulysses_sharding_manager:
+            #data = self.ulysses_sharding_manager.preprocess_data(data)
+            with adapter_ctx:
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+            output = DataProto.from_dict(
+                tensors={"log_probs": output},
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
+            #output = self.ulysses_sharding_manager.postprocess_data(output)
+        '''with adapter_ctx:
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+        output = DataProto.from_dict(
+                tensors={"log_probs": output},
+                meta_info={"temperature": self.config.rollout.temperature},
+            )'''
+
+        output = output.to("cpu")
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
+
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @DistProfiler.annotate(color="purple")
+    def compute_log_prob_micro_batch(self, data: DataProto):
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(get_device_id())
+        # set meta / temperature as you like
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["micro_batch_size"] = len(data)
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            log_probs = self.actor.compute_log_prob_micro_batch(
+                data=data
+            )
+            out = DataProto.from_dict(tensors={"log_probs": log_probs}, meta_info={"temperature": self.config.rollout.temperature})
+            out = self.ulysses_sharding_manager.postprocess_data(out)
+
+        out = out.to("cpu")
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return out
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="blue")

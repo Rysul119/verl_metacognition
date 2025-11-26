@@ -20,9 +20,8 @@ from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 
-
-@register("naive")
-class NaiveRewardManager:
+@register("naive_reasoning")
+class NaiveReasoningRewardManager:
     """The reward manager."""
 
     def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
@@ -30,6 +29,7 @@ class NaiveRewardManager:
         Initialize the NaiveRewardManager instance.
 
         Args:
+            actor: actor from the actor work group to get log_probs
             tokenizer: The tokenizer used to decode token IDs into text.
             num_examine: The number of batches of decoded responses to print to the console for debugging purpose.
             compute_score: A function to compute the reward score. If None, `default_compute_score` will be used.
@@ -41,7 +41,7 @@ class NaiveRewardManager:
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
 
-    def __call__(self, data: DataProto, return_dict=False):
+    def __call__(self, data: DataProto, actor, config, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
@@ -79,7 +79,11 @@ class NaiveRewardManager:
             extra_info = data_item.non_tensor_batch.get("extra_info", {})
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             extra_info["num_turns"] = num_turns
-            extra_info["reasoning_states"] = False
+            extra_info["actor"] = actor
+            extra_info["data"] = data_item
+            extra_info["tokenizer"] = self.tokenizer
+            extra_info["max_response_length"] = 1024 #config.data.max_response_length
+            extra_info["reasoning_states"] = True
 
             score = self.compute_score(
                 data_source=data_source,
@@ -119,3 +123,4 @@ class NaiveRewardManager:
             }
         else:
             return reward_tensor
+

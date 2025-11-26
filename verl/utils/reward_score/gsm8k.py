@@ -38,6 +38,7 @@ def extract_solution(solution_str, method="strict"):
             for final_answer in reversed(answer):
                 if final_answer not in invalid_str:
                     break
+
     return final_answer
 
 
@@ -54,6 +55,11 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
         format_score: the score for the format
         score: the score for the correct answer
     """
+    if method == "math":
+        from . import math_verify
+
+        return math_verify.compute_score(solution_str, ground_truth)
+
     answer = extract_solution(solution_str=solution_str, method=method)
     if answer is None:
         return 0

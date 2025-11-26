@@ -19,6 +19,8 @@ data:
   # For HDFS path, we provide utils to download it to DRAM and convert it to a local path.
   train_files: ~/data/rlhf/gsm8k/train.parquet
 
+  holdout_files: ~/data/rlhf/gsm8k/holdout.parquet
+
   # Validation parquet. Can be a list or a single file.
   val_files: ~/data/rlhf/gsm8k/test.parquet
 
@@ -830,7 +832,10 @@ reward_model:
   # Default is naive. If all verification functions are multiprocessing-safe,
   # the reward manager can be set to prime for parallel verification.
   reward_manager: naive
-
+  reasoning: False
+  metacognition:
+    enabled: False
+    hlayers: [-1]
   # Whether to launch custom reward function asynchronously during log_prob
   launch_reward_fn_async: False
 
