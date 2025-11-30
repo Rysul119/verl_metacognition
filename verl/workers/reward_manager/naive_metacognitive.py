@@ -45,10 +45,10 @@ class NaiveMetaCognitiveRewardManager:
         mean_residuals = actor(data)  # (B, L, H)
         mhs = torch.permute(mean_residuals.batch["hidden_states"], (1,0,2)).to(dtype=torch.float32)[config.reward_model.metacognition.hlayers]     # dim (L, B, H) 
         bs = mhs.shape[1] # batch size as _verl_auto_padding create some padded input
-        print("naive_metacognitive mhs shape {} weights shape {}".format(mhs.shape, weights.shape))
+        #print("naive_metacognitive mhs shape {} weights shape {}".format(mhs.shape, weights.shape))
         activations = torch.matmul(mhs, weights) # mean_hidden_states dim (L,B, H) weights dim (L, H, 1), activation dim (L, B, 1)
         thresholds = torch.median(activations, dim=1)[0] # (L, 1)
-        print("data size {} activations dim {} thresholds dim {}".format(len(data), activations.shape, thresholds.shape))
+        #print("data size {} activations dim {} thresholds dim {}".format(len(data), activations.shape, thresholds.shape))
         already_print_data_sources = {}
 
         for i in range(bs):

@@ -1275,6 +1275,15 @@ class RayPPOTrainer:
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                            # Log training rewards for plotting
+                            training_scores = reward_tensor.sum(-1).cpu().tolist()
+                            metrics.update({
+                                "training/reward/mean": np.mean(training_scores),
+                                "training/reward/min": np.min(training_scores),
+                                "training/reward/max": np.max(training_scores),
+                                "training/reward/std": np.std(training_scores)
+                            })
+
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)

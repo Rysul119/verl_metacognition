@@ -44,6 +44,8 @@ def run_ppo(config) -> None:
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "true",
                     #"NCCL_DEBUG": "WARN",
+                    #"TORCH_DISTRIBUTED_DEBUG": "DETAIL",
+                    #"TORCH_NCCL_TRACE_BUFFER_SIZE": "2" ,
                     "NCCL_DEBUG": "INFO",
                     "NCCL_DEBUG_SUBSYS": "ALL",
                     "VLLM_LOGGING_LEVEL": "WARN",
