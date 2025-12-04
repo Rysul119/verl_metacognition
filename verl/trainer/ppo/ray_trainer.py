@@ -778,7 +778,7 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * len(sample_inputs)))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -797,7 +797,7 @@ class RayPPOTrainer:
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         data_sources = np.concatenate(data_source_lst, axis=0)
-
+        print("data sources len {} sample inputs len {}".format(len(data_sources), len(sample_inputs)))
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -1128,8 +1128,8 @@ class RayPPOTrainer:
                 lr_clf = LogisticRegression(penalty='l2', C=1, solver='lbfgs', max_iter=10000)
                 lr_clf.fit(mean_hidden_states_l, labels)
                 w = lr_clf.coef_.T # dim (H, 1)
-                w_norm = w/np.linalg.norm(w, keepdims=True) # normalize the weights
-                weights.append(torch.tensor(w_norm)[None, :]) 
+                #w_norm = w/np.linalg.norm(w, keepdims=True) # normalize the weights
+                weights.append(torch.tensor(w)[None, :]) 
             #print("weight list length {}".format(len(weights)))
             self.lr_weights = torch.vstack(weights).to(dtype=torch.float32) # [L, H, 1]
             #print("lr weights shape {}".format(self.lr_weights.shape))
@@ -1159,6 +1159,63 @@ class RayPPOTrainer:
         )
 
         for epoch in range(self.config.trainer.total_epochs):
+            
+            # calculate the axes
+            if self.config.reward_model.metacognition.enabled:
+                try:
+                    from sklearn.linear_model import LogisticRegression
+                except Exception as e:
+                    raise RuntimeError(
+                        "scikit-learn is required only on the driver when metacognition.enabled=True. "
+                        "Install it in the controller env (pip install scikit-learn)."
+                    ) from e
+
+                mean_hidden_states = []
+                labels = []
+                for batch_dict in self.holdout_dataloader:
+                    batch: DataProto = DataProto.from_single_dict(batch_dict)
+                    bs, seqlen = batch.batch["input_ids"].size()
+                    #print("batch size {} sequence len {}".format(bs, seqlen))
+                    # minimal meta_info expected by get_mean_hidden_states
+                    if "micro_batch_size" not in batch.meta_info:
+                        mb = (
+                            self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu")
+                            or self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size")
+                            or bs
+                        )
+                        batch.meta_info["micro_batch_size"] = int(mb)
+                    batch.meta_info["use_dynamic_bsz"] = False
+                    if batch.meta_info["use_dynamic_bsz"] and "max_token_len" not in batch.meta_info:
+                        batch.meta_info["max_token_len"] = int(seqlen)
+                    if "temperature" not in batch.meta_info:
+                        batch.meta_info["temperature"] = 1.0
+                    
+                    batch.batch["responses"] = batch.batch["input_ids"].new_empty((bs, 0))  # zero-length response
+                    batch.meta_info["_verl_auto_padding"] = True # allows when full batch is not divisible by chunk size
+                    mhs = self.actor_rollout_wg.get_mean_hidden_states(batch).batch["hidden_states"]
+                    #print("mean_hidden_state size {}".format(mhs.size()))
+                    mean_hidden_states.append(mhs) # (mb, L, H)
+                    y = batch_dict["label"]
+                    #print("y type {} y shape {}".format(type(y), len(y)))
+                    labels.append(y)
+                #print("label size {}".format(len(labels)))
+                mean_hidden_states = torch.permute(torch.cat(mean_hidden_states, dim=0), (1,0,2)).to(dtype=torch.float32).numpy() # (L, b, H)
+                selected_hidden_states = mean_hidden_states[self.config.reward_model.metacognition.hlayers]
+                labels = np.concatenate(labels) # (b,)
+                labels = np.asarray(labels, dtype=np.int64)
+                #print("mean_hidden_states size {}, labels size {}".format(mean_hidden_states.shape, labels.shape))
+                weights = []
+                for mean_hidden_states_l in selected_hidden_states:
+                    lr_clf = LogisticRegression(penalty='l2', C=1, solver='lbfgs', max_iter=10000)
+                    lr_clf.fit(mean_hidden_states_l, labels)
+                    w = lr_clf.coef_.T # dim (H, 1)
+                    #w_norm = w/np.linalg.norm(w, keepdims=True) # normalize the weights
+                    weights.append(torch.tensor(w)[None, :]) 
+                #print("weight list length {}".format(len(weights)))
+                self.lr_weights = torch.vstack(weights).to(dtype=torch.float32) # [L, H, 1]
+                #print("lr weights shape {}".format(self.lr_weights.shape))
+                #self.lr_weights=None
+
             for batch_dict in self.train_dataloader:
                 do_profile = (
                     self.global_steps in self.config.trainer.profile_steps
