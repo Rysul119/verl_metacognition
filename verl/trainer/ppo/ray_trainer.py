@@ -1111,7 +1111,7 @@ class RayPPOTrainer:
                 
                 batch.batch["responses"] = batch.batch["input_ids"].new_empty((bs, 0))  # zero-length response
                 batch.meta_info["_verl_auto_padding"] = True # allows when full batch is not divisible by chunk size
-                mhs = self.actor_rollout_wg.get_reduced_hidden_states(batch, self.config.reward_model.metacognition.reduction).batch["hidden_states"]
+                mhs = self.actor_rollout_wg.get_reduced_hidden_states(batch, self.config.reward_model.metacognition.hidden_reduction).batch["hidden_states"]
                 #print("mean_hidden_state size {}".format(mhs.size()))
                 mean_hidden_states.append(mhs) # (mb, L, H)
                 y = batch_dict["label"]
@@ -1192,7 +1192,7 @@ class RayPPOTrainer:
                     
                     batch.batch["responses"] = batch.batch["input_ids"].new_empty((bs, 0))  # zero-length response
                     batch.meta_info["_verl_auto_padding"] = True # allows when full batch is not divisible by chunk size
-                    mhs = self.actor_rollout_wg.get_reduced_hidden_states(batch, self.config.reward_model.metacognition.reduction).batch["hidden_states"]
+                    mhs = self.actor_rollout_wg.get_reduced_hidden_states(batch, self.config.reward_model.metacognition.hidden_reduction).batch["hidden_states"]
                     #print("mean_hidden_state size {}".format(mhs.size()))
                     mean_hidden_states.append(mhs) # (mb, L, H)
                     y = batch_dict["label"]

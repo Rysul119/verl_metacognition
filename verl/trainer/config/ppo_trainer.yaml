@@ -835,7 +835,7 @@ reward_model:
   reasoning: False
   metacognition:
     enabled: False
-    reduction: mean
+    hidden_reduction: mean
     hlayers: [-1]
   # Whether to launch custom reward function asynchronously during log_prob
   launch_reward_fn_async: False
