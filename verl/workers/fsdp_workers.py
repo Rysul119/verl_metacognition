@@ -777,7 +777,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output = self.actor.get_reduced_hidden_states(data=data)
+                output = self.actor.get_reduced_hidden_states(data=data,reduction=reduction)
             output = DataProto.from_dict(
                 tensors={"hidden_states": output}, # bs, L, H
                 meta_info={"temperature": self.config.rollout.temperature},

@@ -42,7 +42,7 @@ class NaiveMetaCognitiveRewardManager:
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
         data.meta_info["_verl_auto_padding"] = True # pad when batch size is not divisible by chunk size
-        mean_residuals = actor(data)  # (B, L, H)
+        mean_residuals = actor(data, config.reward_model.metacognition.reduction)  # (B, L, H)
         mhs = torch.permute(mean_residuals.batch["hidden_states"], (1,0,2)).to(dtype=torch.float32)[config.reward_model.metacognition.hlayers]     # dim (L, B, H) 
         bs = mhs.shape[1] # batch size as _verl_auto_padding create some padded input
         #print("naive_metacognitive mhs shape {} weights shape {}".format(mhs.shape, weights.shape))
