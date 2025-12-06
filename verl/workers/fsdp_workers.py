@@ -754,7 +754,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="yellow")
-    def get_mean_hidden_states(self, data: DataProto):
+    def get_reduced_hidden_states(self, data: DataProto, reduction: str):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
@@ -777,7 +777,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output = self.actor.get_mean_hidden_states(data=data)
+                output = self.actor.get_reduced_hidden_states(data=data)
             output = DataProto.from_dict(
                 tensors={"hidden_states": output}, # bs, L, H
                 meta_info={"temperature": self.config.rollout.temperature},

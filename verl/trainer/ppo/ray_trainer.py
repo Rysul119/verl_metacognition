@@ -760,7 +760,7 @@ class RayPPOTrainer:
             if self.config.reward_model.reasoning:
                 result = self.val_reward_fn(test_batch, self.actor_rollout_wg.compute_log_prob_reward, self.config, return_dict=True)
             elif self.config.reward_model.metacognition.enabled:
-                result = self.val_reward_fn(test_batch, self.lr_weights, self.actor_rollout_wg.get_mean_hidden_states, self.config, return_dict=True)
+                result = self.val_reward_fn(test_batch, self.lr_weights, self.actor_rollout_wg.get_reduced_hidden_states, self.config, return_dict=True)
             else:
                 result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
@@ -1095,7 +1095,7 @@ class RayPPOTrainer:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 bs, seqlen = batch.batch["input_ids"].size()
                 #print("batch size {} sequence len {}".format(bs, seqlen))
-                # minimal meta_info expected by get_mean_hidden_states
+                # minimal meta_info expected by get_reduced_hidden_states
                 if "micro_batch_size" not in batch.meta_info:
                     mb = (
                         self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu")
@@ -1111,7 +1111,7 @@ class RayPPOTrainer:
                 
                 batch.batch["responses"] = batch.batch["input_ids"].new_empty((bs, 0))  # zero-length response
                 batch.meta_info["_verl_auto_padding"] = True # allows when full batch is not divisible by chunk size
-                mhs = self.actor_rollout_wg.get_mean_hidden_states(batch).batch["hidden_states"]
+                mhs = self.actor_rollout_wg.get_reduced_hidden_states(batch).batch["hidden_states"]
                 #print("mean_hidden_state size {}".format(mhs.size()))
                 mean_hidden_states.append(mhs) # (mb, L, H)
                 y = batch_dict["label"]
@@ -1176,7 +1176,7 @@ class RayPPOTrainer:
                     batch: DataProto = DataProto.from_single_dict(batch_dict)
                     bs, seqlen = batch.batch["input_ids"].size()
                     #print("batch size {} sequence len {}".format(bs, seqlen))
-                    # minimal meta_info expected by get_mean_hidden_states
+                    # minimal meta_info expected by get_reduced_hidden_states
                     if "micro_batch_size" not in batch.meta_info:
                         mb = (
                             self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu")
@@ -1192,7 +1192,7 @@ class RayPPOTrainer:
                     
                     batch.batch["responses"] = batch.batch["input_ids"].new_empty((bs, 0))  # zero-length response
                     batch.meta_info["_verl_auto_padding"] = True # allows when full batch is not divisible by chunk size
-                    mhs = self.actor_rollout_wg.get_mean_hidden_states(batch).batch["hidden_states"]
+                    mhs = self.actor_rollout_wg.get_reduced_hidden_states(batch).batch["hidden_states"]
                     #print("mean_hidden_state size {}".format(mhs.size()))
                     mean_hidden_states.append(mhs) # (mb, L, H)
                     y = batch_dict["label"]
@@ -1328,7 +1328,7 @@ class RayPPOTrainer:
                             if self.config.reward_model.reasoning:
                                 reward_tensor, reward_extra_infos_dict = compute_reward_reasoning(batch, self.actor_rollout_wg.compute_log_prob_reward, self.config, self.reward_fn)
                             elif self.config.reward_model.metacognition.enabled:
-                                reward_tensor, reward_extra_infos_dict = compute_reward_metacognitive(batch, self.lr_weights, self.actor_rollout_wg.get_mean_hidden_states, self.config, self.reward_fn)
+                                reward_tensor, reward_extra_infos_dict = compute_reward_metacognitive(batch, self.lr_weights, self.actor_rollout_wg.get_reduced_hidden_states, self.config, self.reward_fn)
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 

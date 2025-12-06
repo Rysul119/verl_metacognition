@@ -529,7 +529,7 @@ class DataParallelPPOActor(BasePPOActor):
     
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def get_mean_hidden_states(self, data: DataProto) -> torch.Tensor:
+    def get_reduced_hidden_states(self, data: DataProto, reduction: str) -> torch.Tensor:
         """
         Args:
             data (DataProto): a DataProto containing keys
@@ -542,7 +542,9 @@ class DataParallelPPOActor(BasePPOActor):
                 ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
 
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
-        Returns mean (over tokens) prompt-only hidden states aggregated over micro-batches.
+            reduction: a string
+                options: 'mean', 'last'
+        Returns reduced prompt-only hidden states aggregated over micro-batches.
 
         Shape: (num_layers_minus_1, batch_size, hidden_size)  == (L, B, H)
         """
@@ -610,12 +612,17 @@ class DataParallelPPOActor(BasePPOActor):
                 # Broadcast mask to (1, mbs, P, 1)
                 m = prompt_mask.to(dtype=hidden.dtype, device=hidden.device).unsqueeze(0).unsqueeze(-1)
                 
-                # Weighted mean over tokens (dim=2)
-                num = (hidden * m).sum(dim=2)     # (L, mbs, H)
-                denom = m.sum(dim=2).clamp_min(1e-6)   # (1, mbs, 1)
-                means = (num / denom) # (L, mbs, H)
-                #print("hidden mean shape {}".format(means.shape))
-                hidden_mean_chunks.append(means)
+                if reduction=="mean":
+                    # Weighted mean over tokens (dim=2)
+                    num = (hidden * m).sum(dim=2)     # (L, mbs, H)
+                    denom = m.sum(dim=2).clamp_min(1e-6)   # (1, mbs, 1)
+                    reduced = (num / denom) # (L, mbs, H)
+                    #print("hidden mean shape {}".format(reduction.shape))
+                elif reduction=='last':
+                    reduced = (hidden * m)[:,:,-1, :] # (L, mbs, H)
+                else:
+                    raise NotImplementedError(f"{reduction} reduction is not implemented.")
+                hidden_mean_chunks.append(reduced)
 
         # concat along batch dim (dim=1)
         hidden_states = torch.permute(torch.cat(hidden_mean_chunks, dim=1), (1,0,2))  # (bs, L, H)
